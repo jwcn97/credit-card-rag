@@ -1,4 +1,5 @@
 import os
+import requests
 from dotenv import load_dotenv
 import streamlit as st
 from langchain_chroma import Chroma
@@ -9,6 +10,23 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 load_dotenv()
+
+
+CARD_URLS = {
+    "CITI_REWARDS": "https://www.citibank.com.sg/credit-cards/rewards/citi-rewards-card/pdf/10x-rewards-promotion-terms-and-conditions-2020.pdf",
+    "HSBC_REVOLUTION": "https://www.hsbc.com.sg/content/dam/hsbc/sg/documents/credit-cards/revolution/revo-up-promotion-terms-and-conditions.pdf",
+    "DBS_WOMEN_WORLD": "https://www.dbs.com.sg/iwov-resources/media/pdf/cards/dbs-womans-card-tnc.pdf",
+    "UOB_PPV": "https://www.uob.com.sg/web-resources/personal/pdf/personal/cards/credit-cards/rewards-cards/uob-preferred-platinum-visa-card/terms-and-conditions-for-preferred-plat-visa.pdf",
+    "OCBC_REWARDS": "https://www.ocbc.com/iwov-resources/sg/ocbc/personal/pdf/cards/tnc-titaniumrewards-creditcard-programme-wef-1nov23.pdf",
+}
+
+CARD_ALIASES = {
+    "CITI_REWARDS": "Citi Rewards Card",
+    "HSBC_REVOLUTION": "HSBC Revolution Card",
+    "DBS_WOMEN_WORLD": "DBS Women's World Card",
+    "UOB_PPV": "UOB Preferred Platinum Visa",
+    "OCBC_REWARDS": "OCBC Rewards Card",
+}
 
 
 def get_collection_name() -> str:
@@ -33,8 +51,11 @@ def get_vector_store():
     )
 
 
-def get_retriever():
-    return get_vector_store().as_retriever(search_kwargs={"k": 4})
+def get_retriever(card_keys: list[str] | None = None):
+    search_kwargs: dict = {"k": 4}
+    if card_keys:
+        search_kwargs["filter"] = {"card_key": {"$in": card_keys}}
+    return get_vector_store().as_retriever(search_kwargs=search_kwargs)
 
 
 @st.cache_resource
@@ -42,10 +63,28 @@ def get_chat_model():
     return init_chat_model(os.getenv("CHAT_MODEL"))
 
 
-def build_prompt(question: str, context: str) -> str:
-    return f"""You are a helpful assistant answering questions based on the provided context.
-If the answer is not in the context, say you don't know.
+def lookup_mcc_codes(merchant: str) -> list[dict]:
+    try:
+        resp = requests.get(f"https://heymax.ai/api/v2/merchant/{merchant}", timeout=5)
+        resp.raise_for_status()
+        return resp.json().get("data", {}).get("mcc_v2", [])
+    except Exception:
+        return []
 
+
+def build_prompt(question: str, context: str, mcc_entries: list[dict] | None = None) -> str:
+    mcc_section = ""
+    if mcc_entries:
+        lines = "\n".join(
+            f"- MCC {e['mcc_code']}: {e['mcc_desc']} ({e['l2_category']})"
+            for e in mcc_entries
+        )
+        mcc_section = f"\nMerchant MCC codes:\n{lines}\n"
+
+    return f"""You are a helpful assistant that helps users maximise credit card miles and rewards in Singapore.
+Answer based only on the provided context from the credit card benefit guides.
+If the answer is not in the context, say you don't know.
+{mcc_section}
 Context:
 {context}
 
@@ -55,12 +94,12 @@ Question:
 Answer:"""
 
 
-def ingest_pdf_urls(urls: list[str]) -> tuple[int, list[str]]:
+def ingest_pdf_urls(card_urls: dict[str, str]) -> tuple[int, list[str]]:
     all_chunks = []
     errors = []
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
-    for url in urls:
+    for card_key, url in card_urls.items():
         url = url.strip()
         if not url:
             continue
@@ -68,9 +107,12 @@ def ingest_pdf_urls(urls: list[str]) -> tuple[int, list[str]]:
             loader = PyPDFLoader(url)
             data = loader.load()
             chunks = splitter.split_documents(data)
+            for chunk in chunks:
+                chunk.metadata["card_key"] = card_key
+                chunk.metadata["card_name"] = CARD_ALIASES.get(card_key, card_key)
             all_chunks.extend(chunks)
         except Exception as exc:
-            errors.append(f"{url}: {exc}")
+            errors.append(f"{CARD_ALIASES.get(card_key, card_key)}: {exc}")
 
     if all_chunks:
         get_vector_store().add_documents(documents=all_chunks)
@@ -92,56 +134,56 @@ def clear_current_collection() -> int:
     return len(ids)
 
 
-st.set_page_config(page_title="FAQ Chat", page_icon="💬")
-st.title("💬 Ask Your Agent")
-st.caption(
-    f"Retrieval-Augmented Q&A over your data from `{get_collection_name()}`"
-)
+st.set_page_config(page_title="Credit Card Miles Agent", page_icon="💳")
+st.title("💳 Credit Card Miles Agent")
+st.caption("Ask questions about miles and rewards for Singapore credit cards.")
 
 with st.sidebar:
     st.header("Data Management")
 
-    with st.form("load_urls_form", clear_on_submit=True):
-        urls_input = st.text_area(
-            "PDF URLs (one per line)",
-            placeholder="https://example.com/document.pdf",
-        )
-        load_urls_clicked = st.form_submit_button("Load URLs", use_container_width=True)
-
-    if load_urls_clicked:
-        urls = [u for u in urls_input.splitlines() if u.strip()]
-        if not urls:
-            st.warning("Please enter at least one PDF URL.")
+    if st.button("Reload card data", use_container_width=True):
+        configured = {k: v for k, v in CARD_URLS.items() if v.strip()}
+        if not configured:
+            st.warning("No card URLs configured in CARD_URLS.")
         else:
-            with st.spinner("Indexing documents into Chroma..."):
-                chunk_count, errors = ingest_pdf_urls(urls)
+            with st.spinner("Clearing existing data..."):
+                clear_current_collection()
+            with st.spinner("Indexing card benefit guides..."):
+                chunk_count, errors = ingest_pdf_urls(configured)
             st.cache_resource.clear()
-            st.toast(f"Loaded {len(urls)} URLs ({chunk_count} chunks).", icon="✅")
+            st.toast(f"Loaded {len(configured)} cards ({chunk_count} chunks).", icon="✅")
             if errors:
-                st.error("Some URLs failed to load:")
+                st.error("Some cards failed to load:")
                 for err in errors:
                     st.write(f"- {err}")
 
-    st.divider()
-    st.subheader("Collection Management")
+selected_aliases = st.multiselect(
+    "Filter cards (leave empty to search all):",
+    options=list(CARD_ALIASES.values()),
+    default=list(CARD_ALIASES.values()),
+)
+selected_keys = [k for k, v in CARD_ALIASES.items() if v in selected_aliases]
 
-    if st.button("Delete all chunks (keep DB)", use_container_width=True):
-        deleted_count = clear_current_collection()
-        st.cache_resource.clear()
-        st.toast(f"Deleted {deleted_count} chunks from `{get_collection_name()}`.", icon="✅")
-
-query = st.text_input("Ask a question about your indexed documents:")
+query = st.text_input("Ask about miles and rewards:")
+merchant = st.text_input("Merchant (optional — for MCC-based bonus lookup):")
 
 if query:
-    retriever = get_retriever()
+    retriever = get_retriever(selected_keys if selected_keys != list(CARD_ALIASES.keys()) else None)
     model = get_chat_model()
     docs = retriever.invoke(query)
+
+    mcc_entries = lookup_mcc_codes(merchant) if merchant.strip() else []
+    if merchant.strip() and mcc_entries:
+        codes = ", ".join(e["mcc_code"] for e in mcc_entries)
+        st.caption(f"MCC codes for **{merchant}**: {codes}")
+    elif merchant.strip():
+        st.caption(f"No MCC data found for **{merchant}**.")
 
     if not docs:
         st.warning("No matching chunks found.")
     else:
         context = "\n\n".join(doc.page_content for doc in docs)
-        prompt = build_prompt(query, context)
+        prompt = build_prompt(query, context, mcc_entries)
         response = model.invoke(prompt)
 
         st.subheader("Answer")
@@ -149,8 +191,8 @@ if query:
 
         with st.expander("Retrieved chunks"):
             for idx, doc in enumerate(docs, start=1):
-                source = doc.metadata.get("source", "unknown")
+                card_name = doc.metadata.get("card_name", "unknown")
                 page = doc.metadata.get("page", "unknown")
-                st.markdown(f"**Chunk {idx}** — source: `{source}`, page: `{page}`")
+                st.markdown(f"**Chunk {idx}** — {card_name}, page `{page}`")
                 st.write(doc.page_content)
                 st.divider()
