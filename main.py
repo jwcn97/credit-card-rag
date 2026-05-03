@@ -1,6 +1,4 @@
 import os
-import shutil
-from pathlib import Path
 from dotenv import load_dotenv
 import streamlit as st
 from langchain_chroma import Chroma
@@ -57,31 +55,22 @@ Question:
 Answer:"""
 
 
-def ingest_uploaded_pdfs(uploaded_files) -> tuple[int, list[str]]:
+def ingest_pdf_urls(urls: list[str]) -> tuple[int, list[str]]:
     all_chunks = []
     errors = []
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    upload_tmp_dir = Path("docs/.tmp_uploads")
-    upload_tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        for uploaded_file in uploaded_files:
-            try:
-                temp_pdf_path = upload_tmp_dir / uploaded_file.name
-                temp_pdf_path.write_bytes(uploaded_file.getvalue())
-
-                loader = PyPDFLoader(str(temp_pdf_path))
-                data = loader.load()
-                chunks = splitter.split_documents(data)
-
-                for chunk in chunks:
-                    chunk.metadata["uploaded_filename"] = uploaded_file.name
-
-                all_chunks.extend(chunks)
-            except Exception as exc:
-                errors.append(f"{uploaded_file.name}: {exc}")
-    finally:
-        shutil.rmtree(upload_tmp_dir, ignore_errors=True)
+    for url in urls:
+        url = url.strip()
+        if not url:
+            continue
+        try:
+            loader = PyPDFLoader(url)
+            data = loader.load()
+            chunks = splitter.split_documents(data)
+            all_chunks.extend(chunks)
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
 
     if all_chunks:
         get_vector_store().add_documents(documents=all_chunks)
@@ -112,24 +101,24 @@ st.caption(
 with st.sidebar:
     st.header("Data Management")
 
-    with st.form("load_files_form", clear_on_submit=True):
-        uploaded_files = st.file_uploader(
-            "Load files (drag and drop PDFs)",
-            type=["pdf"],
-            accept_multiple_files=True,
+    with st.form("load_urls_form", clear_on_submit=True):
+        urls_input = st.text_area(
+            "PDF URLs (one per line)",
+            placeholder="https://example.com/document.pdf",
         )
-        load_files_clicked = st.form_submit_button("Load files", use_container_width=True)
+        load_urls_clicked = st.form_submit_button("Load URLs", use_container_width=True)
 
-    if load_files_clicked:
-        if not uploaded_files:
-            st.warning("Please upload at least one PDF file first.")
+    if load_urls_clicked:
+        urls = [u for u in urls_input.splitlines() if u.strip()]
+        if not urls:
+            st.warning("Please enter at least one PDF URL.")
         else:
             with st.spinner("Indexing documents into Chroma..."):
-                chunk_count, errors = ingest_uploaded_pdfs(uploaded_files)
+                chunk_count, errors = ingest_pdf_urls(urls)
             st.cache_resource.clear()
-            st.toast(f"Loaded {len(uploaded_files)} files ({chunk_count} chunks).", icon="✅")
+            st.toast(f"Loaded {len(urls)} URLs ({chunk_count} chunks).", icon="✅")
             if errors:
-                st.error("Some files failed to load:")
+                st.error("Some URLs failed to load:")
                 for err in errors:
                     st.write(f"- {err}")
 
