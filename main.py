@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import streamlit as st
 from langchain_chroma import Chroma
 from langchain.chat_models import init_chat_model
+from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -49,6 +50,25 @@ def get_vector_store():
         embedding_function=get_embeddings(),
         persist_directory=get_persist_directory(),
     )
+
+
+def detect_section(text: str) -> str:
+    t = text.lower()
+    if any(k in t for k in ["eligible", "qualification", "who can apply"]):
+        return "eligibility"
+    if any(k in t for k in ["definition", "interpretation"]):
+        return "definitions"
+    if any(k in t for k in ["reward", "points", "miles", "cashback"]):
+        return "rewards"
+    if any(k in t for k in ["promotion", "bonus", "campaign"]):
+        return "promotion"
+    if any(k in t for k in ["exclude", "not eligible", "will not earn"]):
+        return "exclusions"
+    if any(k in t for k in ["annual fee", "fee", "charge"]):
+        return "fees"
+    if any(k in t for k in ["cap", "maximum", "limit"]):
+        return "limits"
+    return "general"
 
 
 def get_retriever(card_keys: list[str] | None = None):
@@ -97,20 +117,35 @@ Answer:"""
 def ingest_pdf_urls(card_urls: dict[str, str]) -> tuple[int, list[str]]:
     all_chunks = []
     errors = []
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=80)
 
     for card_key, url in card_urls.items():
         url = url.strip()
         if not url:
             continue
         try:
-            loader = PyPDFLoader(url)
-            data = loader.load()
-            chunks = splitter.split_documents(data)
-            for chunk in chunks:
-                chunk.metadata["card_key"] = card_key
-                chunk.metadata["card_name"] = CARD_ALIASES.get(card_key, card_key)
-            all_chunks.extend(chunks)
+            loader = PyPDFLoader(url, mode="page")
+            pages = loader.load()
+
+            # Group pages by detected section
+            section_texts: dict[str, list[str]] = {}
+            for page in pages:
+                section = detect_section(page.page_content)
+                section_texts.setdefault(section, []).append(page.page_content)
+
+            # Merge pages within each section, then split
+            card_name = CARD_ALIASES.get(card_key, card_key)
+            for section, texts in section_texts.items():
+                merged = Document(
+                    page_content="\n\n".join(texts),
+                    metadata={"card_key": card_key, "card_name": card_name, "section": section},
+                )
+                chunks = splitter.split_documents([merged])
+                for chunk in chunks:
+                    chunk.page_content = (
+                        f"Card: {card_name}\nSection: {section}\n\n{chunk.page_content}"
+                    )
+                all_chunks.extend(chunks)
         except Exception as exc:
             errors.append(f"{CARD_ALIASES.get(card_key, card_key)}: {exc}")
 
@@ -192,7 +227,7 @@ if query:
         with st.expander("Retrieved chunks"):
             for idx, doc in enumerate(docs, start=1):
                 card_name = doc.metadata.get("card_name", "unknown")
-                page = doc.metadata.get("page", "unknown")
-                st.markdown(f"**Chunk {idx}** — {card_name}, page `{page}`")
+                section = doc.metadata.get("section", "unknown")
+                st.markdown(f"**Chunk {idx}** — {card_name}, section `{section}`")
                 st.write(doc.page_content)
                 st.divider()
